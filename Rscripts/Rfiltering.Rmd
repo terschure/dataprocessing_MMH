@@ -1,0 +1,764 @@
+---
+title: "R filtering of MMH herbivore diet dataset"
+author: "Anneke ter Schure"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+This Rmarkdown file uses the results from OBITools processing as input and further filters the metabarcoding data.
+The code provided here is a mash-up from different sources, but primarily the ForBio course: DNA Metabarcoding: Data processing and interpretation.
+Special thanks and credit goes to the teachers: 
+Eric Coissac
+Frédéric Boyer
+Youri Lammers
+
+
+This script includes the following steps:
+
+- Reformatting of the data into samples, motus and reads data frames
+- Checking the data
+- Removal of sequences that were identified only as ‘internal’ in the obiclean step
+- Removal of sequences with higher occurrence (i.e. more reads) in negative controls than in samples
+- Keeping sequences with a percentage identity >95%
+- Reduction of each sequence read count per sample with 0.001% to correct for potential leakage
+- Removal of unreliable PCR replicates
+- Removal of rare sequences that make up <1% of the sample
+
+
+```{r}
+# preparing the R environment
+library(tidyverse)
+library(vegan)
+library(ade4)
+```
+
+## Loading the data
+
+```{r}
+raw = read.delim("../data/obitools_MOTUmatrix_MMH.tab")
+rownames(raw) = raw$id
+```
+
+### seperate into the motus and reads tables
+```{r}
+motus = select(raw, -(23:273))
+
+reads = as.data.frame(t(select(raw, (23:273))))
+reads[is.na(reads)] = 0 # change NAs (reads found for one database but not the other) into zeros 
+```
+
+### get the sample data
+```{r}
+# get the sample names from the reads table
+names = as.character(rownames(reads))
+samplenames_split = strsplit(names,"[.]")
+
+# save the last part as the full sample name
+samplenames = sapply(samplenames_split, function(x) x[length(x)])
+
+# split the names on the underscores
+sample_names_split = strsplit(samplenames,"_")
+
+# save the first part as the sample id
+sample_id = sapply(sample_names_split, function(x) x[1])
+
+# extract type of animal (wild or domestic)
+animal_type = sapply(sample_names_split, function(x) x[2])
+
+# extract animal ID on label
+species_label = sapply(sample_names_split, function(x) x[3])
+
+# extract animal ID according to the sanger sequencing data
+species_id = sapply(sample_names_split, function(x) x[4])
+
+# extract animal ID percentage
+id_percentage = sapply(sample_names_split, function(x) x[5])
+
+# extract number of primer pairs that gave the ID
+id_primers = sapply(sample_names_split, function(x) x[6])
+
+# save the last part as replicate
+replicate = sapply(sample_names_split, function(x) x[7])
+
+# replace letter codes for the actual herbivore species names
+species_id[grep(pattern = "^0",species_id)]="blank"
+species_id[grep(pattern = "^W",species_id)]="Wild_boar" 
+species_id[grep(pattern = "^A",species_id)]="Asian_palm_civet"
+species_id[grep(pattern = "^BD",species_id)]="Barking_deer"
+species_id[grep(pattern = "^BU",species_id)]="Water_buffalo"
+species_id[grep(pattern = "^C",species_id)]="Cattle"
+species_id[grep(pattern = "^E",species_id)]="Asian_elephant"
+species_id[grep(pattern = "^G",species_id)]="Domestic_goat"
+species_id[grep(pattern = "^M",species_id)]="Bonnet_macaque"
+species_id[grep(pattern = "^P",species_id)]="Indian_porcupine"
+species_id[grep(pattern = "^R",species_id)]="Indian_hare"
+species_id[grep(pattern = "^SA",species_id)]="Sambar_deer"
+species_id[grep(pattern = "^SB",species_id)]="Sloth_bear"
+
+# get sample categories; binary for wild and domestic animals
+wild = animal_type == "w"
+domestic = animal_type == "d"
+
+# and replace the single letter codes with actual words
+animal_type[grep(pattern = "^w",animal_type)]="wild"
+animal_type[grep(pattern = "^d", animal_type)]="domestic"
+
+# label everything as sample, except the controls
+sample_type = rep("sample",length(samplenames))
+sample_type[grep(pattern = "^PCR",samplenames)]="pcrneg"
+sample_type[grep(pattern = "^En",samplenames)]="extneg"
+
+# make sure data is set to NA depending on sample type and herbivore id score
+animal_type[sample_type != "sample"] = NA
+species_label[sample_type != "sample"] = NA
+species_id[sample_type != "sample" | id_percentage == 94] = NA
+id_percentage[sample_type != "sample" | id_percentage == 94] = NA
+id_primers[sample_type != "sample"] = NA
+wild[sample_type != "sample"] = NA
+domestic[sample_type != "sample"] = NA
+```
+
+### Build a sample data frame with those columns
+```{r}
+samples = data.frame(name = samplenames,
+                         sample_id = paste(sample_id, species_id, sep = "_"),
+                         replicate = replicate,
+                         type      = as.factor(sample_type),
+                         animal    = animal_type,
+                         label     = species_label,
+                         animal_id = species_id,
+                         perc_id   = id_percentage,
+                         primers   = id_primers,
+                         wild      = wild,
+                         domestic  = domestic,
+                         nonReplicating = FALSE
+                         )
+rownames(samples) = samples$name
+
+# rename the samples in the reads table as well
+rownames(reads) = samples$name
+```
+
+#### Add database information to MOTUs
+```{r}
+# prepare a list
+sequence_type = rep("Unknown",nrow(motus))
+
+# check if the identity of sequences is determined by both reference libraries
+sequence_type[motus$`best_identity.db_trnl` > 0.9499 &
+              motus$`best_identity.db_mmhills` > 0.9499] = "both" 
+#global reference library
+sequence_type[motus$`best_identity.db_trnl` > 0.9499 &
+              motus$`best_identity.db_mmhills` < 0.9499] = "embl" 
+#local reference library
+sequence_type[motus$`best_identity.db_trnl` < 0.9499 &
+              motus$`best_identity.db_mmhills` > 0.9499] = "mmhills" 
+
+motus$sequence_type=factor(sequence_type)
+```
+
+```{r}
+# check how many sequences are identified by which database
+length(sequence_type)
+length(sequence_type[sequence_type == "Unknown"])
+length(sequence_type[sequence_type == "both"])
+length(sequence_type[sequence_type == "mmhills"])
+length(sequence_type[sequence_type == "embl"])
+
+# check if everything is accounted for;
+length(sequence_type) - (length(sequence_type[sequence_type == "Unknown"]) +
+                           length(sequence_type[sequence_type == "both"]) +
+                           length(sequence_type[sequence_type == "mmhills"]) +
+                           length(sequence_type[sequence_type == "embl"]))
+```
+
+
+## Basic descriptions of the samples
+```{r}
+# Counting the reads per PCR reaction
+reads_per_pcr = rowSums(reads)
+
+# Counting the MOTUs per PCR reaction
+motus_per_pcr = rowSums(reads > 0)
+```
+
+```{r}
+par(mfrow=c(1,2))
+hist(log10(reads_per_pcr),
+     breaks=50,
+     main = "Reads per PCR",
+     xlab="Reads count (log scale)")
+hist(motus_per_pcr,breaks=50,
+     main = "MOTUs per PCR",
+     xlab="MOTU count")
+```
+
+```{r}
+plot(reads_per_pcr,motus_per_pcr,
+     xlab="Read counts",
+     ylab="MOTU counts",
+     cex=0.3,
+     col = samples$type,
+     log="xy")
+
+legend("bottomright",
+       legend = levels(samples$type),
+       fill = 1:length(levels(samples$type)))
+```
+
+```{r}
+# Number of reads per MOTU
+reads_per_motu = colSums(reads)
+
+plot(reads_per_motu,
+     motus$`best_identity.trnl_india`,
+     cex=0.3,
+     col = motus$sequence_type,
+     xlab= "read counts per MOTU",
+     ylab= "best id of the MOTU with ref DB",
+     log="xy")
+legend("bottomright",
+       legend = levels(motus$sequence_type),
+       fill=1:length(levels(motus$sequence_type)),
+       cex=0.6)
+```
+
+### Look at the obiclean status
+
+```{r}
+obiclean_statussus = select(motus, starts_with("obiclean_status")) 
+internal = obiclean_statussus =='i'
+
+always_internal = apply(internal,MARGIN = 1,FUN = all,na.rm = TRUE) 
+table(always_internal)
+```
+
+```{r}
+plot(reads_per_motu,
+     motus$`best_identity.trnl_india`,
+     cex=0.3,
+     col = always_internal + 1,
+     xlab= "read counts per MOTU",
+     ylab= "best id of the MOTU with ref DB",
+     log="xy")
+legend("bottomright",
+       legend = c('H or S','Internal'),
+       fill=1:2,
+       cex=0.6)
+```
+
+
+## Filtering steps
+
+### Filtering based on obiclean status
+```{r}
+# remove all the sequences with the `internal` obiclean status in all the PCRs
+cleanmotus = motus[! always_internal,]
+cleanreads = reads[,! always_internal]
+
+# check if any samples are now without reads
+cleanreads = cleanreads[rowSums(cleanreads)>0,] 
+cleansamples = samples[rownames(cleanreads),]
+```
+
+```{r}
+reads_per_pcr = rowSums(cleanreads)
+motus_per_pcr = rowSums(cleanreads > 0)
+
+plot(reads_per_pcr,motus_per_pcr,
+     xlab="Read counts",
+     ylab="MOTU counts",
+     cex=0.3,
+     col = cleansamples$type,
+     log="xy")
+
+legend("bottomright",
+       legend = levels(cleansamples$type),
+       fill = 1:length(levels(cleansamples$type)))
+```
+
+```{r}
+dim(cleanmotus) # number of MOTUs
+dim(cleansamples) # number of PCRs
+dim(cleanreads) # number of PCRs x number of MOTUs
+
+sum(rowSums(cleanreads)) # total number of reads
+```
+
+```{r}
+# replace previous tables
+motus = cleanmotus
+samples = cleansamples
+reads = cleanreads
+
+# cleaning up, keep only this selection of annotations
+idx= c("id", "count", "best_identity.db_mmhills", "best_identity.db_trnl",
+       "family_name", "genus_name", "species_name", "scientific_name", "rank",
+       "seq_length", "sequence", "match_count.db_mmhills", "match_count.db_trnl", "species_list.db_mmhills", "species_list.db_trnl")
+motus = motus[, idx]
+
+##most abundant on top
+idx = order(colSums(reads), decreasing=T)
+motus = motus[idx,]
+reads = reads[,idx]
+colnames(reads) = motus$id
+```
+
+
+## Identification of artifacts
+
+### Sequencing depth and richness distribution
+```{r}
+#get #reads & #MOTUs / sample
+plot(rowSums(reads), rowSums(reads>0), 
+     col=as.factor(samples[rownames(reads), 'type']),
+     log='xy', pch=16, xlab='#Reads', ylab='#MOTUs')
+
+legend('topleft', 
+       legend = levels(as.factor(samples[rownames(reads), 'type'])),
+       col=1:nlevels(as.factor(samples[rownames(reads), 'type'])), 
+       pch=16, cex=0.5)
+```
+
+## Reagent Contaminants
+
+### Identify MOTUs of max abundance in extraction/pcr controls
+
+```{r, results="hide", warning=FALSE}
+stopifnot(all(rownames(samples)==rownames(reads)))
+
+maxInExtractionCtrl <- apply(reads[samples$type=='extneg',], MARGIN=2, function(x) max(x,na.rm = T))
+maxInPCRCtrl        <- apply(reads[samples$type=='pcrneg',], MARGIN=2, function(x) max(x,na.rm = T))
+maxInSamples        <- apply(reads[samples$type=='sample',], MARGIN=2, function(x) max(x,na.rm = T))
+
+df <- data.frame(maxInExtractionCtrl, maxInPCRCtrl, maxInSamples)
+
+#determining the type of problematic MOTU
+motus$bias <- c('extneg','pcrneg',NA)[apply(df, MARGIN=1, FUN=which.max)]
+
+#adding MOTUs infos
+infosCols <- c("count", "best_identity.db_mmhills", "best_identity.db_trnl", "family_name", "genus_name","species_name", "bias")
+
+df <- cbind(df, motus[,infosCols])
+
+#keeping only problematic sequences for display
+df <- df[!is.na(df$bias),]
+df <- df[order(df$maxInExtractionCtrl+df$maxInPCRCtrl, decreasing=T),]
+
+head(df)
+```
+
+## Vizualizing level of contaminants in samples
+
+```{r}
+stopifnot(all(colnames(reads)==motus$id))
+
+if (dim(df)[1] > 1) {
+  plot(rowSums(reads[, !is.na(motus$bias)]), rowSums(reads[,!is.na(motus$bias)]>0), 
+     col=as.factor(samples[rownames(reads), 'type']),
+     log='xy', pch=16, xlab='#Reads', ylab='#MOTUs')
+
+  legend('topleft', 
+       legend = levels(as.factor(samples[rownames(reads), 'type'])),
+       col=1:nlevels(as.factor(samples[rownames(reads), 'type'])), 
+       pch=16, cex=0.5)
+} else {
+  plot(sum(reads[, !is.na(motus$bias)]), sum(reads[,!is.na(motus$bias)]>0), 
+     col=as.factor(samples[rownames(reads), 'type']),
+     log='xy', pch=16, xlab='#Reads', ylab='#MOTUs')
+
+  legend('topleft', 
+       legend = levels(as.factor(samples[rownames(reads), 'type'])),
+       col=1:nlevels(as.factor(samples[rownames(reads), 'type'])), 
+       pch=16, cex=0.5)
+}
+
+```
+
+## Identifying MOTUs that are highly degraded
+
+
+Assuming the primers are specific enough to the target group and the reference DB for the taxonomic assignation is representative enough; any MOTU with a low identity is probably a degraded/chimeric MOTU
+If this is true, highly abundant MOTU should have a better identity threshold.
+
+```{r}
+breaks <- seq(floor(min(motus$best_identity.db_trnl)*100)/100, 1, by=1/100)
+
+cols <- colorRampPalette(c('white','red','darkred'))(length(breaks)-1)
+
+hist(motus$best_identity.db_trnl, breaks=breaks, col=cols, main='Identity scores of MOTU', 
+     xlab='Best identity score')
+
+thresh = 0.63
+abline(v=thresh, col='red')
+
+motus$degraded = motus$best_identity.db_trnl<thresh
+
+
+plot(colSums(reads), motus$best_identity.db_trnl, xlab='#Reads',ylab='Best identity',
+log='x', cex=0.5, pch=16, col='#00000080')
+abline(h=thresh, col='red')
+```
+## Identifying tag switching
+
+*Credit for this code goes to Frédéric Boyer*
+
+Tag switching obviously depends on the tags, but, as a simplifying hypothesis:
+- we will consider the leaking of a sequence is directly linked to its abundance (i.e. if a sequence is in high amount in the data, it has more chance of being involved in a tag-switch event)
+
+```{r}
+# blanks should only have MOTUs that are 'leaking'
+blks <- samples$type=='pcrneg'
+blks[is.na(blks)] <- FALSE
+
+OTUsInBlks <- colSums(reads[blks,])>0
+
+plot(colSums(reads[blks,OTUsInBlks]), colSums(reads[!blks,OTUsInBlks]), 
+     log='xy', pch=16, col='#00000080',
+     xlab='Sum of abundance in blanks', ylab='Abundance in total')
+
+plot(apply(reads[blks,OTUsInBlks], MARGIN=2, FUN=max), colSums(reads[!blks,OTUsInBlks]), 
+     log='xy', pch=16, col='#00000080',
+     xlab='Max abundance in blanks', ylab='Abundance in total')
+```
+
+```{r}
+# check if MOTUs in blanks have higher counts than the samples
+boxplot(list(`OTUs in blks`=colSums(reads[,OTUsInBlks]), 
+             `OTUs not in blks`=colSums(reads[,!OTUsInBlks])), outpch = NA,
+             main='Abundance of OTUs found and not found\nin blanks', ylab='Abundance',
+             log='y')
+stripchart(list(OTUsInBlk=colSums(reads[,OTUsInBlks]), 
+                OTUsNotInBlks=colSums(reads[,!OTUsInBlks])), vertical = T, 
+                method="jitter", pch=16, cex=0.4, add=T)
+
+# then this test should be significant
+wilcox.test(x=colSums(reads[,OTUsInBlks]), y=colSums(reads[,!OTUsInBlks]), alternative = "greater")
+
+```
+
+```{r}
+plot(colSums(reads>0), colSums(reads),
+     log='xy', pch=16, col='#00000080',
+     xlab='#samples the MOTU has count > 0', ylab='Abundance in total')
+```
+
+### Removing tag-switching (leaking)
+
+As a working hypothesis:
+If we consider leaking to be linearly linked to the abundance of the MOTU, we can decrease the counts of all MOTUs depending on their abundance to remove this leaking effect.
+
+```{r}
+# determine mean contribution of leaking in % for all MOTUs based on counts of blanks
+totalCountsDueToLeaking <- colSums(reads[blks,OTUsInBlks])/sum(blks)*nrow(reads)
+
+ratios <- totalCountsDueToLeaking / colSums(reads[,OTUsInBlks])
+
+thrLeak <- c(0, 1/100000, 1/10000, 5/10000, 1/1000, 1/100, 2/100, 3/100, 4/100, 5/100)
+
+
+# determine the best ratio
+correctedCountsForBlks <- lapply(thrLeak, function(thr) {
+  r <- sweep(reads[blks,], MARGIN=2, STATS=ceiling(colSums(reads)*thr/nrow(reads)), FUN='-')
+  r[r<0] <- 0
+  r
+})
+
+names(correctedCountsForBlks) <- thrLeak
+boxplot(lapply(correctedCountsForBlks, function(x) rowSums(x>0)), ylab='Remaining #MOTUs', xlab='potential threshold',
+        las=2, cex=0.5, outpch = NA, main='Effect of leaking removal\non #MOTUs for blanks')
+stripchart(lapply(correctedCountsForBlks, function(x) rowSums(x>0)), vertical = T, 
+                method="jitter", pch=16, cex=0.4, add=T)
+
+boxplot(lapply(correctedCountsForBlks, function(x) rowSums(x)), ylab='Remaining #Reads', xlab='potential threshold',
+        las=2, cex=0.5, outpch = NA, main='Effect of leaking removal\non #Reads for blanks')
+stripchart(lapply(correctedCountsForBlks, function(x) rowSums(x)), vertical = T, 
+                method="jitter", pch=16, cex=0.4, add=T)
+
+```
+
+```{r}
+# set the threshold for reduction based on previous code chunk
+thr <- 1/100000 
+
+# count of reads to remove for each MOTU in each sample
+toRemove <- ceiling(colSums(reads)*thr/nrow(reads)) 
+
+# remove the reads for each MOTU in each sample
+correctedCounts1 <- sweep(reads, MARGIN=2, STATS=toRemove, FUN='-')
+correctedCounts1[correctedCounts1<0] <- 0
+
+# check the effects
+plot(rowSums(reads), rowSums(correctedCounts1), xlab='#Reads before cleaning for leaking',
+     ylab='#Reads after cleaning for leaking', main='Effect of leaking removal on #Reads')
+abline(a=0,b=1)
+
+plot(rowSums(reads>0), rowSums(correctedCounts1>0), xlab='#MOTUs before cleaning for leaking',
+     ylab='#MOTUs after cleaning for leaking', main='Effect of leaking removal on #MOTUs')
+abline(a=0,b=1)
+```
+
+## Removing the contaminants
+
+```{r}
+# how many were labeled as bias?
+table(motus$bias)
+```
+
+```{r}
+# set the counts of these and those that have a best_identity < 95% to zero
+correctedCounts2 <- correctedCounts1
+correctedCounts2[,!is.na(motus$bias) | (motus$best_identity.db_mmhills < 0.95 & motus$best_identity.db_trnl < 0.95)] <- 0
+
+plot(rowSums(reads), rowSums(correctedCounts2), xlab='#Reads before cleaning for contaminants',
+     ylab='#Reads after cleaning for contaminants', main='Effect of contaminants removal\non #Reads',
+     col=as.factor(samples[rownames(reads), 'type']), pch=16)
+abline(a=0,b=1)
+
+legend('topleft', 
+       legend = levels(as.factor(samples[rownames(reads), 'type'])),
+       col=1:nlevels(as.factor(samples[rownames(reads), 'type'])), 
+       pch=16, cex=0.5)
+
+plot(rowSums(reads>0), rowSums(correctedCounts2>0), xlab='#MOTUs before cleaning for contaminants',
+     ylab='#MOTUs after cleaning for contaminants', main='Effect of contaminants removal\non #MOTUs',
+     col=as.factor(samples[rownames(reads), 'type']), pch=16)
+abline(a=0,b=1)
+
+legend('topleft', 
+       legend = levels(as.factor(samples[rownames(reads), 'type'])),
+       col=1:nlevels(as.factor(samples[rownames(reads), 'type'])), 
+       pch=16, cex=0.5)
+
+```
+
+## Remove PCRs with a low amount of reads, i.e. empty PCRs
+```{r}
+l <- lapply(levels(as.factor(samples[rownames(correctedCounts2), 'type'])), function(st) {
+  rowSums(correctedCounts2[samples[rownames(correctedCounts2), 'type']==st,])
+})
+names(l) <- levels(as.factor(samples[rownames(correctedCounts2), 'type']))
+
+boxplot(l, las=2, cex=0.25, outpch=NA, main='#reads before filtering')
+stripchart(l, vertical = T, 
+           method="jitter", pch=16, cex=0.4, add=T)
+thrCount <- 5000
+abline(h=thrCount, col='red')
+```
+
+```{r}
+# Tagging PCRs with too few reads
+samples$empty_PCR <- FALSE
+
+stopifnot(all(rownames(samples)==rownames(correctedCounts2)))
+samples$empty_PCR[rowSums(correctedCounts2)<thrCount] <- TRUE
+```
+
+
+## Remove PCR replicates that are too different one to each other
+*Credit for this code goes to Frédéric Boyer*
+
+The steps we are taking to remove non-replicating PCR replicates:
+1. choose a meaningful distance among samples
+2. compare between replicates and non replicates 
+3. discard replicates that are responsible for the large distances among replicates, 
+   to be a 'large' distance is defined with the 'null' distances, i.e. the distances between 
+   non PCR-replicates
+4. repeat until no more PCR replicates are removed
+
+```{r, results="hide"}
+# helper function to remove bad PCRs in a distance sub-matrix of sample replicates
+identifyBad <- function(subMat, thr) {
+  toSuppress <- c()
+  if (any(subMat>thr)) {
+    if (nrow(subMat)==2) {
+      toSuppress <- c(toSuppress, rownames(subMat))
+    } else {
+      toSuppress <- c(colnames(subMat)[which.max(colSums(subMat))], 
+                      identifyBad(subMat[-which.max(colSums(subMat)),
+                                         -which.max(colSums(subMat))], thr))
+    }
+  }
+  return(toSuppress)
+}
+
+
+samples$nonReplicating <- FALSE
+
+i <- 0
+repeat {
+    i <- i+1
+    print(paste('Iteration',i))
+    
+    dataM <- correctedCounts2[samples$type=='sample' & ! samples$nonReplicating,]
+  
+    h <- ade4::dudi.coa(sqrt(dataM), scannf=F, nf=2)
+    
+    
+    #---
+    cols = 1:nlevels(as.factor(samples[rownames(h$li),'type']))
+    nbReads <- rowSums(correctedCounts2[rownames(h$li),])
+    plot(h$li, col=cols[as.factor(samples[rownames(h$li),'type'])], pch=16, 
+         main=paste('Correspondance analysis\non sqrt transformed data\nIteration',i),
+         cex=nbReads/max(nbReads)*1)
+    #---
+    
+    
+    distM <- as.matrix(dist(h$li))
+  
+    # adjust this regex to fit how the replicates are coded in the row names
+    replicates <- gsub(pattern='_[abc]$','',rownames(distM))
+  
+    withinReplicates <- outer(replicates, replicates, FUN="==") & upper.tri(distM)
+    notWithinReplicates <- outer(replicates, replicates, FUN="!=") & upper.tri(distM)
+
+    d1 <- density(distM[withinReplicates], from=0, to=max(distM), n=1000)
+    d2 <- density(distM[notWithinReplicates], from=0, to=max(distM), n=1000)
+  
+    plot(d1$x, d1$y, type='l', xlab='Distances', ylab='Density', 
+         main=paste('Distances densities\nIteration',i))
+    lines(d2, col='red')
+    thrDist <- d2$x[min(which(d1$y<d2$y))]
+    abline(v=thrDist, col='red')
+  
+    needToBeChecked <- unique(gsub('_[abc]$','',rownames(which(distM>thrDist & withinReplicates,
+                                                                arr.ind=T))))
+    if (length(needToBeChecked)>0) {
+      for (s in needToBeChecked) {
+        pattern <- paste0('^',s)
+        subMat <- distM[grep(rownames(distM), pattern = pattern), 
+                        grep(colnames(distM), pattern = pattern)]
+        samples$nonReplicating[rownames(samples) %in% identifyBad(subMat, thrDist)] <- TRUE
+      }
+    }
+    else {
+      break;
+    }
+  }
+
+# adjust this regex to fit how the replicates are coded in the row names
+numreppersample <- table(gsub('_[abc]$','',rownames(samples)[!samples$nonReplicating & samples$type=='sample']))
+
+tt <- table(numreppersample)
+barplot(tt, main = '#kept replicates')
+
+cols = 1:nlevels(as.factor(samples[rownames(h$li),'type']))
+nbReads <- rowSums(correctedCounts2[rownames(h$li),])
+plot(h$li, col=cols[as.factor(samples[rownames(h$li),'type'])], pch=16, 
+     main='Correspondance analysis\non sqrt transformed data\nfor the kept replicates',
+     cex=nbReads/max(nbReads)*1)
+
+
+legend('topleft', legend = levels(as.factor(samples[rownames(h$li),'type'])), pch=16,
+       col=cols, cex=0.75)
+```
+
+```{r}
+# So we're keeping those that are not nonReplicating as we need at least 2 replicates to keep a sample
+keepsamples <- rownames(samples)[!samples$nonReplicating & samples$type=='sample']
+
+#subsetting the corrected readcounts and sample matrices 
+samp2 <- samples[keepsamples, ]
+counts <- correctedCounts2[keepsamples, ]
+
+#remove empty motus
+counts2 <- counts[, colSums(counts)>0]
+motus2 <- motus[colSums(counts)>0, ]
+```
+
+## Merging the replicates and some further filtering steps
+```{r}
+counts_merged = aggregate(counts2,
+                           MARGIN = 1, #calculate across rows
+                           by = list(sample_id=samp2$sample_id),
+                           FUN = mean)
+
+rownames(counts_merged) = counts_merged$sample_id
+counts_merged$sample_id = NULL
+
+samp2$name = NULL
+samp2$replicate = NULL
+samp2$empty_PCR = NULL
+samples_merged = aggregate(samp2,
+                           MARGIN = 1, #calculate across rows
+                           by = list(sample_id=samp2$sample_id),
+                           FUN = unique
+                            )
+rownames(samples_merged) = samples_merged$sample_id
+```
+
+## remove those samples that have no id or are only present once
+```{r}
+table(samples_merged$animal_id)
+```
+
+```{r}
+remove_samples = rownames(samples_merged[is.na(samples_merged$animal_id) | samples_merged$animal_id == "" | samples_merged$animal_id == "NA",])
+
+reads_clean = counts_merged[!rownames(counts_merged) %in% remove_samples,]
+
+samples_clean = samples_merged[!rownames(samples_merged) %in% remove_samples,]
+
+table(samples_clean$animal_id)
+```
+
+```{r}
+remove_motus2 = rownames(motus2[colSums(reads_clean) == 0,])
+counts_clean = reads_clean[,!colnames(reads_clean) %in% remove_motus2]
+motus_clean = motus2[!rownames(motus2) %in% remove_motus2,]
+
+dim(counts_clean)
+dim(motus_clean)
+```
+
+## Filter out the rare diet items
+```{r}
+# we will remove items corresponding to less than $1%$ in each diet
+require(vegan)
+relfreq = decostand(counts_clean,method = "total")
+counts_clean[relfreq < 0.01]=0
+
+# remove the motus identified as not occurring in the area by expert
+counts_clean["India-GH00000419"] = 0
+counts_clean["India-GH00011256"] = 0
+counts_clean["India-GH00000499"] = 0
+counts_clean["India-GH00000017"] = 0
+counts_clean["India-GH00008391"] = 0
+counts_clean["India-GH00000049"] = 0
+counts_clean["India-GH00000063"] = 0
+
+# check for MOTUs with no more sequence associated)
+reads_per_pcr = colSums(counts_clean)
+table(reads_per_pcr==0)
+
+# remove the empty motus
+counts_clean2 <- counts_clean[, colSums(counts_clean)>0]
+motus_clean2 <- motus_clean[colSums(counts_clean)>0, ]
+dim(counts_clean2)
+dim(motus_clean2)
+```
+```{r}
+reads_per_pcr = rowSums(counts_clean2)
+motus_per_pcr = rowSums(counts_clean2 > 0)
+
+plot(reads_per_pcr,motus_per_pcr,
+     xlab="Read counts",
+     ylab="MOTU counts",
+     cex=0.3,
+     col = as.factor(samples_clean$animal),
+     log="xy")
+
+legend("topright",cex=0.6,
+       legend = levels(as.factor(samples_clean$animal)),
+       fill = 1:length(levels(as.factor(samples_clean$animal))))
+```
+
+## Save the filtered dataset
+```{r}
+# save the resulting tables
+write.csv(motus_clean2,file = "../data/GH.motus.filtered.merged.norare.csv")
+write.csv(samples_clean,file = "../data/GH.samples.filtered.merged.norare.csv")
+write.csv(counts_clean2,file = "../data/GH.reads.filtered.merged.norare.csv") 
+```
+
